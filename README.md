@@ -131,13 +131,7 @@ python scripts/play.py Mjlab-Velocity-Flat-D1 \
 
 ---
 
-## Algorithm overview (NP3O)
-
-NP3O extends PPO with:
-
-- **BarlowTwins SSL** — a self-supervised history encoder learns robust proprioceptive representations from observation history, giving the actor implicit state estimation without extra privileged obs at inference time.
-- **Constrained optimization** — optional cost terms (joint limits, torque limits, undesired contacts, etc.) are enforced via Lagrangian multipliers that grow during training.
-- **Privileged critic** — critic sees physical parameters (contact state, kp/kd randomization factors, terrain scans) invisible to the policy, improving value estimates during training only.
+## Project Structure
 
 Key source files:
 
