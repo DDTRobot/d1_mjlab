@@ -201,3 +201,9 @@ Verify that your task is registered:
 ```bash
 python scripts/train.py --list-tasks
 ```
+
+---
+
+## Acknowledgments
+
+This project is built on [mjlab](https://github.com/mujocolab/mjlab) and ported from the original IsaacLab-based [LocomotionWithNP3O](https://github.com/zeonsunlightyu/LocomotionWithNP3O).
