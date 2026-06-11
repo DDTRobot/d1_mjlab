@@ -22,7 +22,7 @@ This is an **mjlab-native** migration from the original IsaacLab-based `DDT_Lab-
 ### 1. Create conda environment
 
 ```bash
-conda create -n your_env_name python=3.11
+conda create -n <your_env_name> python=3.11
 conda activate your_env_name
 ```
 
@@ -44,8 +44,8 @@ pip install mjlab==1.4.0
 ### 4. Clone this repo
 
 ```bash
-git clone <repo-url> np3o-mjlab
-cd np3o-mjlab
+git clone <repo-url> ddt_mjlab-np3o
+cd ddt_mjlab-np3o
 ```
 
 ### 5. Verify installation
@@ -71,7 +71,7 @@ Available tasks:
 ## Training
 
 ```bash
-conda activate your_env_name
+conda activate <your_env_name>
 
 # D1 — flat ground
 python scripts/train.py Mjlab-Velocity-Flat-D1 # Task's name
