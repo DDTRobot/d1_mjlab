@@ -37,7 +37,7 @@ from mjlab.envs.mdp import (
     push_by_setting_velocity,
     time_out,
 )
-from mjlab.envs.mdp.dr import pd_gains
+from mjlab.envs.mdp.dr import body_com_offset, geom_friction, pd_gains, pseudo_inertia
 from mjlab.envs.mdp.actions import JointPositionActionCfg, JointVelocityActionCfg
 from mjlab.managers import (
     EventTermCfg,
@@ -263,19 +263,19 @@ def _d1_rough_cost_terms() -> dict:
                 "soft_ratio": _D1_SOFT_VEL_LIMIT_FACTOR,
             },
         ),
-        "hip_pos": CostTermCfg(
-            func=cost_hip_pos,
-            scale=2.0, d_value=0.0, k_value=0.01,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=HIP_JOINT_PATTERN)},
-        ),
-        "default_joint": CostTermCfg(
-            func=cost_default_joint,
-            scale=0.2, d_value=0.0, k_value=0.01,
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names=THIGH_CALF_JOINT_PATTERN),
-                "default_joint_pos_patterns": _D1_DEFAULT_JOINT_POS,
-            },
-        ),
+        # "hip_pos": CostTermCfg(
+        #     func=cost_hip_pos,
+        #     scale=2.0, d_value=0.0, k_value=0.01,
+        #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=HIP_JOINT_PATTERN)},
+        # ),
+        # "default_joint": CostTermCfg(
+        #     func=cost_default_joint,
+        #     scale=0.2, d_value=0.0, k_value=0.01,
+        #     params={
+        #         "asset_cfg": SceneEntityCfg("robot", joint_names=THIGH_CALF_JOINT_PATTERN),
+        #         "default_joint_pos_patterns": _D1_DEFAULT_JOINT_POS,
+        #     },
+        # ),
     }
 
 
@@ -545,11 +545,38 @@ def d1_rough_env_cfg(
 
     if not play:
         events["randomize_actuator_gains"] = EventTermCfg(
-            func=pd_gains, mode="startup",
+            func=pd_gains, mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", actuator_names=".*"),
                 "kp_range": (0.8, 1.2), "kd_range": (0.8, 1.2),
                 "operation": "scale", "distribution": "uniform",
+            },
+        )
+
+        # Domain randomization: robot body mass+inertia, CoM offset, and surface friction.
+        # pseudo_inertia scales mass and inertia together, matching IsaacLab's
+        # randomize_rigid_body_mass with recompute_inertia=True.
+        events["add_base_mass"] = EventTermCfg(
+            func=pseudo_inertia, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "alpha_range": (-0.05, 0.08), "distribution": "uniform",
+            },
+        )
+        events["add_base_com"] = EventTermCfg(
+            func=body_com_offset, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "ranges": (-0.1, 0.1),
+                "operation": "add", "distribution": "uniform",
+            },
+        )
+        events["robot_geom_friction"] = EventTermCfg(
+            func=geom_friction, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", geom_names=".*"),
+                "ranges": (0.5, 1.5), "operation": "abs", "distribution": "uniform",
+                "axes": [0],
             },
         )
 
@@ -615,7 +642,7 @@ def d1_rough_env_cfg(
         "base_height_l2": RewardTermCfg(func=base_height_l2, weight=-1.0, params={"target_height": 0.45}),
         "joint_torques_l2": RewardTermCfg(func=joint_torques_l2, weight=0.0, params={"asset_cfg": _LEG_ACTUATOR_CFG}),
         "joint_vel_l2": RewardTermCfg(func=joint_vel_l2, weight=0.0, params={"asset_cfg": _LEG_JOINT_CFG}),
-        "joint_acc_l2": RewardTermCfg(func=joint_acc_l2, weight=-2.5e-7, params={"asset_cfg": _ALL_JOINT_CFG}),
+        "joint_acc_l2": RewardTermCfg(func=joint_acc_l2, weight=-1.0e-6, params={"asset_cfg": _ALL_JOINT_CFG}),
         "joint_pos_limits": RewardTermCfg(func=joint_pos_limits, weight=-0.0, params={"asset_cfg": _LEG_JOINT_CFG}),
         "action_rate_l2": RewardTermCfg(func=action_rate_l2, weight=-0.01),
         "undesired_contacts": RewardTermCfg(
@@ -713,9 +740,15 @@ def d1_rough_env_cfg(
         cfg.scene.num_envs = 50
         cfg.scene.env_spacing = 3.0
         cfg.observations["policy"].enable_corruption = False
+        # Distribute play robots evenly across all terrain difficulty levels.
+        cfg.scene.terrain.max_init_terrain_level = None
+        cfg.curriculum.pop("terrain_levels", None)
         cfg.events.pop("base_external_force_torque", None)
         cfg.events.pop("push_robot", None)
         cfg.events.pop("randomize_actuator_gains", None)
+        cfg.events.pop("add_base_mass", None)
+        cfg.events.pop("add_base_com", None)
+        cfg.events.pop("robot_geom_friction", None)
         # Track base_link instead of auto-detecting (which can pick a foot/wheel).
         cfg.viewer.origin_type = cfg.viewer.OriginType.ASSET_ROOT
         cfg.viewer.entity_name = "robot"

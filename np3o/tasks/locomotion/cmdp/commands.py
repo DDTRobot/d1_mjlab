@@ -187,4 +187,7 @@ class UniformVelocityCommand(CommandTerm):
         # Only apply to heading-enabled envs that aren't standing.
         heading_envs = self._is_heading_env & ~self._is_standing_env
         if heading_envs.any():
-            self._command[heading_envs, 2] = heading_error[heading_envs] * self.cfg.heading_control_stiffness
+            ang_vel_z = heading_error[heading_envs] * self.cfg.heading_control_stiffness
+            # Match IsaacLab/IsaacGym: clip to the configured angular velocity range.
+            ang_vel_min, ang_vel_max = self.cfg.ranges.ang_vel_z
+            self._command[heading_envs, 2] = torch.clip(ang_vel_z, min=ang_vel_min, max=ang_vel_max)

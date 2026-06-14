@@ -296,6 +296,22 @@ def joint_vel_l2(
     return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
 
 
+def joint_vel_wheel_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize wheel joint velocities when the base linear command is small.
+
+    Mirrors ``_reward_dof_wheels_vel`` from the IsaacGym source config.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd_norm = torch.linalg.norm(env.command_manager.get_command(command_name)[:, :2], dim=1)
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(joint_vel), dim=1) * (cmd_norm < command_threshold).float()
+
+
 def joint_acc_l2(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -631,25 +647,76 @@ class GaitReward:
 # ---------------------------------------------------------------------------
 
 
-def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]]) -> torch.Tensor:
-    # extract the used quantities (to enable type-hinting)
+def joint_mirror(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    mirror_joints: list[list[str]],
+    mirror_signs: list[list[float]] | None = None,
+) -> torch.Tensor:
+    """Reward symmetry between mirrored joint groups.
+
+    Args:
+        mirror_joints: list of [source_joint_name, target_joint_name] pairs.
+        mirror_signs: optional list of [source_sign, target_sign] per pair.
+            If provided, target joint position is multiplied by target_sign before
+            comparing to source joint position multiplied by source_sign. This
+            mirrors the IsaacGym ``_reward_foot_mirror`` behavior where hip joints
+            have opposite signs on left/right legs.
+    """
     asset: Entity = env.scene[asset_cfg.name]
-    if not hasattr(env, "joint_mirror_joints_cache") or env.joint_mirror_joints_cache is None:
-        # Cache joint positions for all pairs
-        env.joint_mirror_joints_cache = [
-            [asset.find_joints(joint_name) for joint_name in joint_pair] for joint_pair in mirror_joints
-        ]
-    reward = torch.zeros(env.num_envs, device=env.device)
-    # Iterate over all joint pairs
-    for joint_pair in env.joint_mirror_joints_cache:
-        # Calculate the difference for each pair and add to the total reward
-        diff = torch.sum(
-            torch.square(asset.data.joint_pos[:, joint_pair[0][0]] - asset.data.joint_pos[:, joint_pair[1][0]]),
-            dim=-1,
+    cache_key = "joint_mirror_joints_cache"
+    sign_key = "joint_mirror_signs_cache"
+    if not hasattr(env, cache_key) or getattr(env, cache_key) is None:
+        setattr(
+            env,
+            cache_key,
+            [[asset.find_joints(joint_name) for joint_name in joint_pair] for joint_pair in mirror_joints],
         )
+        if mirror_signs is not None:
+            setattr(env, sign_key, [torch.tensor(signs, device=env.device, dtype=torch.float32) for signs in mirror_signs])
+        else:
+            setattr(env, sign_key, None)
+
+    reward = torch.zeros(env.num_envs, device=env.device)
+    cached_signs = getattr(env, sign_key, None)
+    for idx, joint_pair in enumerate(getattr(env, cache_key)):
+        source = asset.data.joint_pos[:, joint_pair[0][0]]
+        target = asset.data.joint_pos[:, joint_pair[1][0]]
+        if cached_signs is not None:
+            source = source * cached_signs[idx][0]
+            target = target * cached_signs[idx][1]
+        diff = torch.sum(torch.square(source - target), dim=-1)
         reward += diff
     reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
     reward *= _upright_gate(env.scene["robot"])
+    return reward
+
+
+def foot_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize left-right leg asymmetry, ported from D1Flat ``_reward_foot_mirror``.
+
+    Matches the original IsaacGym implementation:
+
+        mirror = torch.tensor([-1, 1, 1])
+        reward = sum((FL_leg - RR_leg * mirror)^2) + sum((RL_leg - FR_leg * mirror)^2)
+
+    where each ``*_leg`` group contains the hip/thigh/calf joint positions.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    cache_key = "_foot_mirror_indices"
+    if not hasattr(env, cache_key) or getattr(env, cache_key) is None:
+        fl_ids = [asset.find_joints(f"FL_{j}_joint")[0][0] for j in ("hip", "thigh", "calf")]
+        fr_ids = [asset.find_joints(f"FR_{j}_joint")[0][0] for j in ("hip", "thigh", "calf")]
+        rl_ids = [asset.find_joints(f"RL_{j}_joint")[0][0] for j in ("hip", "thigh", "calf")]
+        rr_ids = [asset.find_joints(f"RR_{j}_joint")[0][0] for j in ("hip", "thigh", "calf")]
+        setattr(env, cache_key, (fl_ids, fr_ids, rl_ids, rr_ids))
+
+    fl_ids, fr_ids, rl_ids, rr_ids = getattr(env, cache_key)
+    mirror = torch.tensor([-1.0, 1.0, 1.0], device=env.device)
+
+    reward = torch.sum(torch.square(asset.data.joint_pos[:, fl_ids] - asset.data.joint_pos[:, rr_ids] * mirror), dim=-1)
+    reward += torch.sum(torch.square(asset.data.joint_pos[:, rl_ids] - asset.data.joint_pos[:, fr_ids] * mirror), dim=-1)
+    reward *= _upright_gate(asset)
     return reward
 
 

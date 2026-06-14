@@ -174,6 +174,13 @@ def main() -> None:
         ):
             cfg.events.pop(event_name, None)
 
+    # During play, distribute robots uniformly across all terrain difficulty
+    # levels instead of starting from the training curriculum's easy levels.
+    if hasattr(cfg.scene, "terrain") and cfg.scene.terrain.terrain_type == "generator":
+        cfg.scene.terrain.max_init_terrain_level = None
+        if hasattr(cfg, "curriculum"):
+            cfg.curriculum.pop("terrain_levels", None)
+
     if hasattr(cfg, "viewer"):
         cfg.viewer.origin_type = cfg.viewer.OriginType.ASSET_ROOT
         cfg.viewer.entity_name = "robot"

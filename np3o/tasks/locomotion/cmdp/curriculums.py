@@ -130,3 +130,47 @@ def commands_vel(
     return {
         "command_max": torch.tensor(max(abs(cfg.ranges.lin_vel_x[0]), cfg.ranges.lin_vel_x[1])),
     }
+
+
+def commands_vel_reward_based(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    reward_term_name: str,
+    reward_scale: float,
+    max_curriculum: float = 1.0,
+    expansion: float = 0.5,
+    threshold_ratio: float = 0.8,
+) -> dict[str, torch.Tensor]:
+    """Reward-based velocity command curriculum matching IsaacGym's D1Flat.
+
+    Increases the ``lin_vel_x`` sampling range by ``expansion`` on each side when
+    the mean per-step tracking reward of the environments being reset exceeds
+    ``threshold_ratio * reward_scale``.  The expansion is clipped to
+    ``[-max_curriculum, max_curriculum]``.  ``lin_vel_y`` and ``ang_vel_z`` are
+    left unchanged, matching the original reference.
+    """
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None
+    cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
+
+    x_min, x_max = cfg.ranges.lin_vel_x
+
+    # Only evaluate once per episode length, matching the original timing:
+    # ``common_step_counter % max_episode_length == 0``.
+    max_steps = max(1, int(env.max_episode_length_s / env.step_dt))
+    if env.common_step_counter > 0 and env.common_step_counter % max_steps == 0 and len(env_ids) > 0:
+        episode_sums = env.reward_manager._episode_sums.get(reward_term_name)
+        if episode_sums is not None:
+            mean_sum = torch.mean(episode_sums[env_ids])
+            # _episode_sums is scaled by dt; divide by episode length in seconds
+            # to obtain the average per-step weighted reward.
+            per_step_reward = mean_sum / env.max_episode_length_s
+            if per_step_reward > threshold_ratio * reward_scale:
+                x_min = max(-max_curriculum, min(x_min - expansion, 0.0))
+                x_max = min(max_curriculum, max(x_max + expansion, 0.0))
+                cfg.ranges.lin_vel_x = (x_min, x_max)
+
+    return {
+        "command_max": torch.tensor(max(abs(cfg.ranges.lin_vel_x[0]), cfg.ranges.lin_vel_x[1])),
+    }

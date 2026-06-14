@@ -38,7 +38,7 @@ from mjlab.envs.mdp import (
     push_by_setting_velocity,
     time_out,
 )
-from mjlab.envs.mdp.dr import pd_gains
+from mjlab.envs.mdp.dr import body_com_offset, geom_friction, pd_gains, pseudo_inertia
 from mjlab.envs.mdp.actions import JointPositionActionCfg, JointVelocityActionCfg
 from mjlab.managers import (
     EventTermCfg,
@@ -574,11 +574,38 @@ def d1h_rough_env_cfg(
 
     if not play:
         events["randomize_actuator_gains"] = EventTermCfg(
-            func=pd_gains, mode="startup",
+            func=pd_gains, mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", actuator_names=".*"),
                 "kp_range": (0.8, 1.2), "kd_range": (0.8, 1.2),
                 "operation": "scale", "distribution": "uniform",
+            },
+        )
+
+        # Domain randomization: robot body mass+inertia, CoM offset, and surface friction.
+        # pseudo_inertia scales mass and inertia together, matching IsaacLab's
+        # randomize_rigid_body_mass with recompute_inertia=True.
+        events["add_base_mass"] = EventTermCfg(
+            func=pseudo_inertia, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "alpha_range": (-0.05, 0.08), "distribution": "uniform",
+            },
+        )
+        events["add_base_com"] = EventTermCfg(
+            func=body_com_offset, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "ranges": (-0.1, 0.1),
+                "operation": "add", "distribution": "uniform",
+            },
+        )
+        events["robot_geom_friction"] = EventTermCfg(
+            func=geom_friction, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", geom_names=".*"),
+                "ranges": (0.5, 1.5), "operation": "abs", "distribution": "uniform",
+                "axes": [0],
             },
         )
 
@@ -735,6 +762,9 @@ def d1h_rough_env_cfg(
         cfg.events.pop("base_external_force_torque", None)
         cfg.events.pop("push_robot", None)
         cfg.events.pop("randomize_actuator_gains", None)
+        cfg.events.pop("add_base_mass", None)
+        cfg.events.pop("add_base_com", None)
+        cfg.events.pop("robot_geom_friction", None)
         cfg.viewer.origin_type = cfg.viewer.OriginType.ASSET_ROOT
         cfg.viewer.entity_name = "robot"
 

@@ -33,7 +33,7 @@ from mjlab.envs.mdp import (
     push_by_setting_velocity,
     time_out,
 )
-from mjlab.envs.mdp.dr import pd_gains
+from mjlab.envs.mdp.dr import body_com_offset, geom_friction, pd_gains, pseudo_inertia
 from mjlab.envs.mdp.actions import JointPositionActionCfg, JointVelocityActionCfg
 from mjlab.managers import (
     EventTermCfg,
@@ -210,14 +210,11 @@ def d1h_flat_env_cfg(
         flatten_policy_history: If True (standard PPO), flatten the policy history dim.
             If False (NP3O), keep 3D shape for the BarlowTwins encoder.
     """
-    terrain_generator = _FLAT_TERRAIN_CFG
-    has_terrain = True
+    has_terrain = False
 
     # ---- Scene ----
     terrain_cfg = TerrainEntityCfg(
-        terrain_type="generator" if has_terrain else "plane",
-        terrain_generator=terrain_generator,
-        max_init_terrain_level=5 if has_terrain else None,
+        terrain_type="plane",
         env_spacing=2.5,
     )
 
@@ -230,19 +227,6 @@ def d1h_flat_env_cfg(
             history_length=2,
         ),
     ]
-
-    if has_terrain:
-        from mjlab.sensor import RayCastSensorCfg, GridPatternCfg, ObjRef
-        sensors.append(
-            RayCastSensorCfg(
-                name="height_scanner",
-                frame=ObjRef(type="body", name="base_link", entity="robot"),
-                pattern=GridPatternCfg(size=(1.6, 1.0), resolution=0.1),
-                ray_alignment="yaw",
-                max_distance=5.0,
-                exclude_parent_body=True,
-            ),
-        )
 
     scene = SceneCfg(
         terrain=terrain_cfg,
@@ -324,13 +308,6 @@ def d1h_flat_env_cfg(
         ),
     }
 
-    scanner_terms = {}
-    if has_terrain:
-        scanner_terms["height_scan"] = ObservationTermCfg(
-            func=safe_height_scan, params={"sensor_name": "height_scanner"},
-            clip=(-1.0, 1.0), scale=1.0,
-        )
-
     observations = {
         "policy": ObservationGroupCfg(
             terms=policy_terms, enable_corruption=not play,
@@ -396,11 +373,38 @@ def d1h_flat_env_cfg(
 
     if not play:
         events["randomize_actuator_gains"] = EventTermCfg(
-            func=pd_gains, mode="startup",
+            func=pd_gains, mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", actuator_names=".*"),
                 "kp_range": (0.8, 1.2), "kd_range": (0.8, 1.2),
                 "operation": "scale", "distribution": "uniform",
+            },
+        )
+
+        # Domain randomization: robot body mass+inertia, CoM offset, and surface friction.
+        # pseudo_inertia scales mass and inertia together, matching IsaacLab's
+        # randomize_rigid_body_mass with recompute_inertia=True.
+        events["add_base_mass"] = EventTermCfg(
+            func=pseudo_inertia, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "alpha_range": (-0.05, 0.08), "distribution": "uniform",
+            },
+        )
+        events["add_base_com"] = EventTermCfg(
+            func=body_com_offset, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "ranges": (-0.1, 0.1),
+                "operation": "add", "distribution": "uniform",
+            },
+        )
+        events["robot_geom_friction"] = EventTermCfg(
+            func=geom_friction, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", geom_names=".*"),
+                "ranges": (0.5, 1.5), "operation": "abs", "distribution": "uniform",
+                "axes": [0],
             },
         )
 
@@ -506,12 +510,12 @@ def d1h_flat_env_cfg(
             resampling_time_range=(10.0, 10.0),
             entity_name="robot",
             rel_standing_envs=0.02,
-            rel_heading_envs=1.0,
+            rel_heading_envs=0.5,
             heading_command=True,
             heading_control_stiffness=0.5,
             debug_vis=False,
             ranges=UniformVelocityCommandCfg.Ranges(
-                lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.0, 0.0),
+                lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
                 ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi),
             ),
         ),
@@ -519,10 +523,6 @@ def d1h_flat_env_cfg(
 
     # ---- Curriculum ----
     curriculum = {}
-    if has_terrain:
-        curriculum["terrain_levels"] = CurriculumTermCfg(
-            func=terrain_levels_vel, params={"command_name": "base_velocity"},
-        )
 
     # ---- Simulation ----
     sim = SimulationCfg(
@@ -554,6 +554,9 @@ def d1h_flat_env_cfg(
         cfg.events.pop("base_external_force_torque", None)
         cfg.events.pop("push_robot", None)
         cfg.events.pop("randomize_actuator_gains", None)
+        cfg.events.pop("add_base_mass", None)
+        cfg.events.pop("add_base_com", None)
+        cfg.events.pop("robot_geom_friction", None)
         cfg.viewer.origin_type = cfg.viewer.OriginType.ASSET_ROOT
         cfg.viewer.entity_name = "robot"
 

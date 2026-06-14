@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 
 import mujoco
+import torch
 
 from mjlab.actuator import IdealPdActuatorCfg
 from mjlab.actuator.dc_actuator import DcMotorActuatorCfg
@@ -32,12 +33,11 @@ from mjlab.envs.mdp import (
     last_action,
     projected_gravity,
     reset_root_state_uniform,
-    reset_joints_by_offset,
     apply_external_force_torque,
     push_by_setting_velocity,
     time_out,
 )
-from mjlab.envs.mdp.dr import pd_gains
+from mjlab.envs.mdp.dr import body_com_offset, geom_friction, pd_gains, pseudo_inertia
 from mjlab.envs.mdp.actions import JointPositionActionCfg, JointVelocityActionCfg
 from mjlab.managers import (
     EventTermCfg,
@@ -62,7 +62,7 @@ from mjlab.utils.nan_guard import NanGuardCfg
 from mjlab.utils.noise.noise_cfg import UniformNoiseCfg
 
 from ...cmdp.commands import UniformVelocityCommandCfg
-from ...cmdp.curriculums import commands_vel, terrain_levels_vel
+from ...cmdp.curriculums import commands_vel_reward_based, terrain_levels_vel
 from ...cmdp.observations import (
     contact_state,
     joint_kp_factor,
@@ -77,6 +77,10 @@ from ...cmdp.rewards import (
     ang_vel_xy_l2,
     base_height_l2,
     default_joint_l2,
+    # foot_mirror,
+    joint_pos_limits,
+    joint_vel_l2,
+    joint_vel_wheel_l2,
     lin_vel_z_l2,
     track_ang_vel_z_exp,
     track_lin_vel_xy_exp,
@@ -295,6 +299,50 @@ def _apply_default_joint_pos_target(
     asset.set_joint_position_target(q_default, joint_ids=asset_cfg.joint_ids)
 
 
+def _reset_joints_by_scale(
+    env, env_ids, asset_cfg: SceneEntityCfg = _ALL_JOINT_CFG,
+    position_scale_range: tuple[float, float] = (0.5, 1.5),
+) -> None:
+    """Reset joint positions by scaling the default pose.
+
+    Matches IsaacGym's ``default_dof_pos * torch_rand_float(0.5, 1.5, ...)`` and
+    DDT_Lab's ``reset_joints_by_scale``. Joint velocities are zeroed.
+    """
+    asset_cfg.resolve(env.scene)
+    asset = env.scene[asset_cfg.name]
+
+    default_joint_pos = asset.data.default_joint_pos[env_ids][:, asset_cfg.joint_ids]
+    soft_joint_pos_limits = asset.data.soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
+
+    scale = torch.empty_like(default_joint_pos).uniform_(*position_scale_range)
+    joint_pos = (default_joint_pos * scale).clamp_(
+        soft_joint_pos_limits[..., 0], soft_joint_pos_limits[..., 1]
+    )
+    joint_vel = torch.zeros_like(joint_pos)
+
+    joint_ids = asset_cfg.joint_ids
+    if isinstance(joint_ids, list):
+        joint_ids = torch.tensor(joint_ids, device=env.device)
+
+    asset.write_joint_state_to_sim(
+        joint_pos.view(len(env_ids), -1),
+        joint_vel.view(len(env_ids), -1),
+        env_ids=env_ids,
+        joint_ids=joint_ids,
+    )
+
+
+def _filter_zero_weight_rewards(
+    rewards: dict[str, RewardTermCfg],
+) -> dict[str, RewardTermCfg]:
+    """Drop reward terms whose weight is exactly zero.
+
+    Keeps the config aligned with the original scales (where several terms are
+    set to 0.0) while preventing them from being printed/computed in mjlab.
+    """
+    return {name: term for name, term in rewards.items() if term.weight != 0.0}
+
+
 # ===========================================================================
 # 3. Environment constants
 # ===========================================================================
@@ -303,7 +351,7 @@ def _apply_default_joint_pos_target(
 # Flat/easy-heightfield terrain (owned by this file)
 # ---------------------------------------------------------------------------
 
-_FLAT_SLOPE_RANGE = (0.0, 0.4)
+_FLAT_SLOPE_RANGE = (0.0, 0.2)
 _FLAT_RANDOM_NOISE_RANGE = (0.0, 0.05)
 _FLAT_WAVE_AMPLITUDE = (0.0, 0.2)
 _FLAT_WAVE_COUNT = 2
@@ -528,11 +576,38 @@ def d1_flat_env_cfg(
 
     if not play:
         events["randomize_actuator_gains"] = EventTermCfg(
-            func=pd_gains, mode="startup",
+            func=pd_gains, mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", actuator_names=".*"),
                 "kp_range": (0.8, 1.2), "kd_range": (0.8, 1.2),
                 "operation": "scale", "distribution": "uniform",
+            },
+        )
+
+        # Domain randomization: robot body mass+inertia, CoM offset, and surface friction.
+        # pseudo_inertia scales mass and inertia together, matching IsaacLab's
+        # randomize_rigid_body_mass with recompute_inertia=True.
+        events["add_base_mass"] = EventTermCfg(
+            func=pseudo_inertia, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "alpha_range": (-0.05, 0.08), "distribution": "uniform",
+            },
+        )
+        events["add_base_com"] = EventTermCfg(
+            func=body_com_offset, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                "ranges": (-0.1, 0.1),
+                "operation": "add", "distribution": "uniform",
+            },
+        )
+        events["robot_geom_friction"] = EventTermCfg(
+            func=geom_friction, mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", geom_names=".*"),
+                "ranges": (0.5, 1.5), "operation": "abs", "distribution": "uniform",
+                "axes": [0],
             },
         )
 
@@ -541,7 +616,7 @@ def d1_flat_env_cfg(
         params={
             "pose_range": {
                 "x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.0, 0.2),
-                "roll": (-0.0, 0.0), "pitch": (-0, 0), "yaw": (-3.14, 3.14),
+                "roll": (-0.5, 0.5), "pitch": (-0.5, 0.5), "yaw": (-3.14, 3.14),
             },
             "velocity_range": {
                 "x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (-0.5, 0.5),
@@ -552,13 +627,10 @@ def d1_flat_env_cfg(
     )
 
     events["reset_robot_joints"] = EventTermCfg(
-        func=reset_joints_by_offset, mode="reset",
+        func=_reset_joints_by_scale, mode="reset",
         params={
-            # Large random offsets on all joints make the posture costs non-zero
-            # from reset. Keep early training close to the nominal pose and do not
-            # randomize wheel positions here.
-            "position_range": (-0.001, 0.001), "velocity_range": (-0.0, 0.0),
             "asset_cfg": _LEG_JOINT_CFG,
+            "position_scale_range": (0.5, 1.5),
         },
     )
 
@@ -598,8 +670,12 @@ def d1_flat_env_cfg(
         "base_height_l2": RewardTermCfg(func=base_height_l2, weight=-1.0, params={"target_height": 0.45}),
         "joint_torques_l2": RewardTermCfg(func=joint_torques_l2, weight=0.0, params={"asset_cfg": _LEG_ACTUATOR_CFG}),
         "joint_vel_l2": RewardTermCfg(func=joint_vel_l2, weight=0.0, params={"asset_cfg": _LEG_JOINT_CFG}),
+        "joint_vel_wheel_l2": RewardTermCfg(
+            func=joint_vel_wheel_l2, weight=-0.01,
+            params={"asset_cfg": _WHEEL_JOINT_CFG, "command_name": "base_velocity", "command_threshold": 0.1},
+        ),
         "joint_acc_l2": RewardTermCfg(func=joint_acc_l2, weight=-2.5e-7, params={"asset_cfg": _ALL_JOINT_CFG}),
-        "joint_pos_limits": RewardTermCfg(func=joint_pos_limits, weight=-0.0, params={"asset_cfg": _LEG_JOINT_CFG}),
+        "joint_pos_limits": RewardTermCfg(func=joint_pos_limits, weight=-10.0, params={"asset_cfg": _LEG_JOINT_CFG}),
         "action_rate_l2": RewardTermCfg(func=action_rate_l2, weight=-0.01),
         "undesired_contacts": RewardTermCfg(
             func=undesired_contacts, weight=-1.0,
@@ -607,16 +683,29 @@ def d1_flat_env_cfg(
         ),
         "upward": RewardTermCfg(func=upward, weight=0.5),
         "default_joint_l2": RewardTermCfg(
-            func=default_joint_l2, weight=-0.5,
+            func=default_joint_l2, weight=-1.0,
             params={"asset_cfg": _LEG_JOINT_CFG, "default_joint_pos_patterns": _D1_DEFAULT_JOINT_POS},
         ),
         "hip_pos": RewardTermCfg(
-            func=default_joint_l2, weight=-1.0,
+            func=default_joint_l2, weight=-0.5,
             params={
                 "asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint"),
                 "default_joint_pos_patterns": _D1_DEFAULT_JOINT_POS,
             },
         ),
+        # "foot_mirror": RewardTermCfg(
+        #     func=foot_mirror, weight=-0.05,
+        #     params={"asset_cfg": _LEG_JOINT_CFG},
+        # ),
+        # "feet_distance_y_exp": RewardTermCfg(
+        #     func=feet_distance_y_exp,
+        #     weight=1.0,
+        #     params={
+        #         "asset_cfg": _FOOT_CFG,
+        #         "stance_width": 0.41,
+        #         "std": 0.20,
+        #     },
+        # ),
     }
 
     # ---- Terminations ----
@@ -634,7 +723,7 @@ def d1_flat_env_cfg(
             resampling_time_range=(10.0, 10.0),
             entity_name="robot",
             rel_standing_envs=0.02,
-            rel_heading_envs=1.0,
+            rel_heading_envs=0.5,
             heading_command=True,
             heading_control_stiffness=0.5,
             debug_vis=False,
@@ -653,14 +742,14 @@ def d1_flat_env_cfg(
         )
 
     curriculum["commands_vel"] = CurriculumTermCfg(
-        func=commands_vel,
+        func=commands_vel_reward_based,
         params={
             "command_name": "base_velocity",
-            "velocity_stages": [
-                {"step": 0, "lin_vel_x": (-1.0, 1.0), "lin_vel_y": (-0.5, 0.5), "ang_vel_z": (-1.0, 1.0)},
-                {"step": 2000 * 24, "lin_vel_x": (-2.0, 2.0), "lin_vel_y": (-1.0, 1.0), "ang_vel_z": (-2.0, 2.0)},
-                {"step": 4000 * 24, "lin_vel_x": (-3.0, 3.0), "lin_vel_y": (-1.5, 1.5), "ang_vel_z": (-3.0, 3.0)},
-            ],
+            "reward_term_name": "track_lin_vel_xy_exp",
+            "reward_scale": 2.0,
+            "max_curriculum": 3.0,
+            "expansion": 0.5,
+            "threshold_ratio": 0.8,
         },
     )
 
@@ -681,17 +770,10 @@ def d1_flat_env_cfg(
 
     cfg = ManagerBasedRlEnvCfg(
         scene=scene, observations=observations, actions=actions,
-        events=events, rewards=rewards, terminations=terminations,
+        events=events, rewards=_filter_zero_weight_rewards(rewards), terminations=terminations,
         commands=commands, curriculum=curriculum, sim=sim,
         decimation=4, episode_length_s=20.0,
     )
-
-    # Flat/easy-heightfield reset profile.
-    cfg.events["reset_base"].params["pose_range"].update({
-        "roll": (-0.05, 0.05),
-        "pitch": (-0.05, 0.05),
-        "yaw": (-3.14, 3.14),
-    })
 
     if play:
         cfg.scene.num_envs = 50
@@ -700,6 +782,9 @@ def d1_flat_env_cfg(
         cfg.events.pop("base_external_force_torque", None)
         cfg.events.pop("push_robot", None)
         cfg.events.pop("randomize_actuator_gains", None)
+        cfg.events.pop("add_base_mass", None)
+        cfg.events.pop("add_base_com", None)
+        cfg.events.pop("robot_geom_friction", None)
         # Track base_link instead of auto-detecting (which can pick a foot/wheel).
         cfg.viewer.origin_type = cfg.viewer.OriginType.ASSET_ROOT
         cfg.viewer.entity_name = "robot"
